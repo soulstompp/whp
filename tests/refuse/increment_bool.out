@@ -1,0 +1,3 @@
+
+Warning: Increment on type bool has no effect, this will change in the next major version of PHP in /w/increment_bool.php on line 3
+ok

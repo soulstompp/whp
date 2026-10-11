@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught Error: Cannot add element to the array as the next element is already occupied in /w/append_after_the_largest_key.php:3
+Stack trace:
+#0 {main}
+  thrown in /w/append_after_the_largest_key.php on line 3

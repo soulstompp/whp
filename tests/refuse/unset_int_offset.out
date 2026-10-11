@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught Error: Cannot unset offset in a non-array variable in /w/unset_int_offset.php:3
+Stack trace:
+#0 {main}
+  thrown in /w/unset_int_offset.php on line 3

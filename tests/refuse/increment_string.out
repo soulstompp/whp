@@ -1,0 +1,3 @@
+
+Deprecated: Increment on non-numeric string is deprecated, use str_increment() instead in /w/increment_string.php on line 3
+b

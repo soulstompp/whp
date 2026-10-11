@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught TypeError: Unsupported operand types: string + int in /w/arithmetic_on_words.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/arithmetic_on_words.php on line 2

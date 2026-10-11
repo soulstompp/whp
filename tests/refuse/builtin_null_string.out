@@ -1,0 +1,3 @@
+
+Deprecated: strlen(): Passing null to parameter #1 ($string) of type string is deprecated in /w/builtin_null_string.php on line 2
+0

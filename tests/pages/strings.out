@@ -1,0 +1,15 @@
+Hello World!
+Braced Worlds
+Array value and value and three
+No $name here\n
+Escapes: 	|\|$|"|A|A|☺||||
+Unknown escape \q stays
+single ' and \ and \n
+Heredoc World
+  indented value
+Nowdoc $name {$a['k']}
+indented closing
+  keeps relative|
+6
+hoe
+hello h

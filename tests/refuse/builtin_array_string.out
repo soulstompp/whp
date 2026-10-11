@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught TypeError: strlen(): Argument #1 ($string) must be of type string, array given in /w/builtin_array_string.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/builtin_array_string.php on line 2

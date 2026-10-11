@@ -1,0 +1,6 @@
+start
+
+Fatal error: Possible integer overflow in memory allocation (2 * 9223372036854775807 + 32) in /w/ceiling_str_repeat_overflow.php on line 3
+Stack trace:
+#0 /w/ceiling_str_repeat_overflow.php(3): str_repeat('ab', 9223372036854775807)
+#1 {main}

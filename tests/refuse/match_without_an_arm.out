@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught UnhandledMatchError: Unhandled match case 3 in /w/match_without_an_arm.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/match_without_an_arm.php on line 2

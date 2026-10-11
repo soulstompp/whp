@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught Error: Undefined constant "NOPE" in /w/undefined_constant.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/undefined_constant.php on line 2

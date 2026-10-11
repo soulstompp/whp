@@ -1,0 +1,6 @@
+
+Fatal error: Uncaught ArgumentCountError: Too few arguments to function f(), 1 passed in /w/too_few_arguments.php on line 3 and exactly 2 expected in /w/too_few_arguments.php:2
+Stack trace:
+#0 /w/too_few_arguments.php(3): f(1)
+#1 {main}
+  thrown in /w/too_few_arguments.php on line 2

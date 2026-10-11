@@ -1,0 +1,6 @@
+
+Fatal error: Uncaught ArithmeticError: Division of PHP_INT_MIN by -1 is not an integer in /w/intdiv_past_the_range.php:2
+Stack trace:
+#0 /w/intdiv_past_the_range.php(2): intdiv(-9223372036854775808, -1)
+#1 {main}
+  thrown in /w/intdiv_past_the_range.php on line 2

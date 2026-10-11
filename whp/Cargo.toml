@@ -1,0 +1,18 @@
+[package]
+name = "whp"
+description = "PHP 8 templates run as requests: each page gives PHP's own bytes or is refused at the line it names. The library, with no I/O of its own."
+keywords = ["php", "template", "interpreter", "web"]
+categories = ["template-engine", "web-programming"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+exclude = ["tests/"]
+
+[dependencies]
+bumpalo = { version = "3.20", features = ["collections", "allocator-api2"] }
+hashbrown = "0.16"
+winnow = "1.0"

@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught Error: Cannot unset string offsets in /w/unset_nested_string.php:3
+Stack trace:
+#0 {main}
+  thrown in /w/unset_nested_string.php on line 3

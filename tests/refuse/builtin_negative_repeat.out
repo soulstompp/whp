@@ -1,0 +1,6 @@
+
+Fatal error: Uncaught ValueError: str_repeat(): Argument #2 ($times) must be greater than or equal to 0 in /w/builtin_negative_repeat.php:2
+Stack trace:
+#0 /w/builtin_negative_repeat.php(2): str_repeat('x', -1)
+#1 {main}
+  thrown in /w/builtin_negative_repeat.php on line 2

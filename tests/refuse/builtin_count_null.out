@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught TypeError: count(): Argument #1 ($value) must be of type Countable|array, null given in /w/builtin_count_null.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/builtin_count_null.php on line 2

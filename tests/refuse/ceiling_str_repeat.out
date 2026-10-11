@@ -1,0 +1,6 @@
+start
+
+Fatal error: Allowed memory size of 134217728 bytes exhausted (tried to allocate 9223372036854775839 bytes) in /w/ceiling_str_repeat.php on line 3
+Stack trace:
+#0 /w/ceiling_str_repeat.php(3): str_repeat('x', 9223372036854775807)
+#1 {main}

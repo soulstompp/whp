@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught DivisionByZeroError: Modulo by zero in /w/modulo_by_zero.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/modulo_by_zero.php on line 2

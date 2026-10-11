@@ -1,0 +1,4 @@
+
+Fatal error: Allowed memory size of 134217728 bytes exhausted (tried to allocate 134217736 bytes) in /w/ceiling_array.php on line 4
+Stack trace:
+#0 {main}

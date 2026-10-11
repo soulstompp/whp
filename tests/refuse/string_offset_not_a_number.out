@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught TypeError: Cannot access offset of type string on string in /w/string_offset_not_a_number.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/string_offset_not_a_number.php on line 2

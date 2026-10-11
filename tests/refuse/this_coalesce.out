@@ -1,0 +1,5 @@
+
+Fatal error: Uncaught Error: Using $this when not in object context in /w/this_coalesce.php:2
+Stack trace:
+#0 {main}
+  thrown in /w/this_coalesce.php on line 2

@@ -1,0 +1,2 @@
+
+Parse error: Invalid UTF-8 codepoint escape sequence: Codepoint too large in /w/heredoc_bad_escape.php on line 4

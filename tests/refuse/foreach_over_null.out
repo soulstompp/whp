@@ -1,0 +1,2 @@
+
+Warning: foreach() argument must be of type array|object, null given in /w/foreach_over_null.php on line 2

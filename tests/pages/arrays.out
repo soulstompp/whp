@@ -1,0 +1,18 @@
+4 5
+int 8 => eight
+str 08 => zero-eight
+int 1 => true-key
+str  => empty-key
+str x => ex
+5a 6b 10c 11d 
+-5a -4b 
+1Z;2B;3C;
+1,2,3,10,20,30
+a,b,7
+ynn
+1=2 2=3 3=10 4=20 5=30 6=99 
+set unset full empty
+2automade
+a 1 1  b|12
+Bchanged
+02

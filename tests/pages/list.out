@@ -1,0 +1,24 @@
+<html><head><title>Orders</title></head>
+<body>
+<table>
+  <tr class="even">
+    <td>1</td>
+    <td>Ana &amp; Bo</td>
+    <td>12.50</td>
+    <td>paid</td>
+  </tr>
+  <tr class="odd">
+    <td>2</td>
+    <td>&lt;script&gt;</td>
+    <td>0.99</td>
+    <td>due</td>
+  </tr>
+  <tr class="even">
+    <td>3</td>
+    <td>Zé</td>
+    <td>1000.00</td>
+    <td>paid</td>
+  </tr>
+</table>
+<p>3 orders, ***</p>
+</body></html>

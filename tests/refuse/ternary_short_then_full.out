@@ -1,0 +1,4 @@
+
+Fatal error: Unparenthesized `a ?: b ? c : d` is not supported. Use either `(a ?: b) ? c : d` or `a ?: (b ? c : d)` in /w/ternary_short_then_full.php on line 2
+Stack trace:
+#0 {main}

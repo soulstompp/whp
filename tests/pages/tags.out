@@ -1,0 +1,11 @@
+<p>before</p>
+one<p>after one</p>
+two
+<p>the blank line above stays</p>
+threefourfiveshortmulti
+ab?> in a string
+x trailing text
+ so this is HTML
+after block
+<p>end</p>
+no close at end

@@ -1,0 +1,4 @@
+
+Fatal error: Constant expression contains invalid operations in /w/default_variable.php on line 2
+Stack trace:
+#0 {main}

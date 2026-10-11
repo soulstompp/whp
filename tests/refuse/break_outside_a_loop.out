@@ -1,0 +1,4 @@
+
+Fatal error: 'break' not in the 'loop' or 'switch' context in /w/break_outside_a_loop.php on line 2
+Stack trace:
+#0 {main}
