@@ -23,8 +23,8 @@ use crate::compile::{Code, Function, Lit, Op, Page};
 use crate::parse::{BinOp, IncludeKind, UnOp};
 use crate::store::Store;
 use crate::value::{
-    Array, Key, Value, compare, identical, loose_equal, release, share, string_fits, to_bytes,
-    to_int_operand, to_key, truthy,
+    Array, Key, STRING_LIMIT, Value, compare, identical, loose_equal, release, share, string_fits,
+    to_bytes, to_int_operand, to_key, truthy,
 };
 
 /// What a request did, read when it ends.
@@ -32,7 +32,7 @@ use crate::value::{
 pub struct Outcome {
     /// The bytes of its page.
     pub out_bytes: u64,
-    /// The bytes the request's own block took.
+    /// The bytes the request's own block took, its large growing strings among them.
     pub block_bytes: usize,
     /// The calls of the page's own functions it made.
     pub calls: u64,
@@ -96,7 +96,14 @@ impl<'s, S: Store + ?Sized> Request<'s, S> {
             Some(wait) => Ok(Step::Wait(wait)),
             None => Ok(Step::Done(Outcome {
                 out_bytes: self.machine.out_bytes,
-                block_bytes: self.block.allocated_bytes(),
+                block_bytes: self.block.allocated_bytes()
+                    + self
+                        .machine
+                        .tails
+                        .big
+                        .iter()
+                        .map(|b| b.capacity())
+                        .sum::<usize>(),
                 calls: self.machine.calls,
                 call_block_max: self.machine.block_bytes_max,
             })),
@@ -159,6 +166,45 @@ type Map<'r, K, V> = HashMap<K, V, DefaultHashBuilder, &'r Bump>;
 /// on the cheapest call that can stop: a call that would make this many is refused.
 const DEEPEST: usize = 915_135;
 
+/// A growing string's buffer: in the block's chunks from `start` to `room_end`, or one of the
+/// block's large buffers (`big`); and whether a value besides the string's variable may hold a
+/// part of it (`lent`). Only bytes past a string's end are written while a buffer is lent, so no
+/// byte any value holds changes; a buffer no other value holds may move as it grows.
+#[derive(Clone, Copy)]
+struct Grow {
+    start: *mut u8,
+    room_end: usize,
+    big: Option<usize>,
+    lent: bool,
+}
+
+/// The strings a block holds that may grow, by the address where each one's bytes end.
+#[derive(Default)]
+struct Tails {
+    map: std::collections::HashMap<usize, Grow>,
+    /// Growing buffers too large for the block's chunks, each an allocation of its own, freed
+    /// with the block.
+    big: Vec<Vec<u8>>,
+}
+
+/// A growing buffer this long or longer is an allocation of its own.
+const BIG: usize = 4096;
+
+/// A returned call's memory: its block's chunks and its own large buffers.
+struct Gone<'a> {
+    block: &'a Bump,
+    big: &'a [Vec<u8>],
+}
+
+impl Gone<'_> {
+    fn holds(&self, p: *const u8) -> bool {
+        holds(self.block, p)
+            || self.big.iter().any(|b| {
+                (b.as_ptr() as usize..b.as_ptr() as usize + b.capacity()).contains(&(p as usize))
+            })
+    }
+}
+
 struct Scope<'r> {
     vars: std::cell::RefCell<Map<'r, &'r [u8], Value<'r>>>,
 }
@@ -204,10 +250,15 @@ struct Machine<'r, 's, S: Store + ?Sized> {
     #[cfg(feature = "poison")]
     #[allow(clippy::vec_box)]
     poisoned: Vec<Box<Bump>>,
+    #[cfg(feature = "poison")]
+    poisoned_big: Vec<Vec<u8>>,
     calls: u64,
     /// The calls of the page's own functions in progress.
     live_calls: usize,
     block_bytes_max: usize,
+    /// The strings that may grow in place, made in the request's block and in each call's.
+    tails: Tails,
+    call_tails: Vec<Tails>,
     store: &'s S,
     out_bytes: u64,
     stack: BVec<'r, Value<'r>>,
@@ -239,9 +290,13 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
             blocks: Vec::new(),
             #[cfg(feature = "poison")]
             poisoned: Vec::new(),
+            #[cfg(feature = "poison")]
+            poisoned_big: Vec::new(),
             calls: 0,
             live_calls: 0,
             block_bytes_max: 0,
+            tails: Tails::default(),
+            call_tails: Vec::new(),
             store,
             out_bytes: 0,
             stack: BVec::new_in(bump),
@@ -269,10 +324,10 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
 
     /// `v`, with whatever of it lies in `from` copied into the current block. A caller's array
     /// the call wrote while it alone held it is rewritten in place.
-    fn evacuate(&self, v: Value<'r>, from: &Bump) -> Value<'r> {
+    fn evacuate(&self, v: Value<'r>, from: &Gone<'_>) -> Value<'r> {
         match v {
-            Value::Str(s) if holds(from, s.as_ptr()) => Value::Str(self.cur().alloc_slice_copy(s)),
-            Value::Array(a) if holds(from, a as *const Array<'r> as *const u8) => {
+            Value::Str(s) if from.holds(s.as_ptr()) => Value::Str(self.cur().alloc_slice_copy(s)),
+            Value::Array(a) if from.holds(a as *const Array<'r> as *const u8) => {
                 Value::Array(a.moved(self.cur(), |k, e| {
                     (self.evacuate_key(k, from), self.evacuate(e, from))
                 }))
@@ -285,17 +340,22 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
         }
     }
 
-    fn evacuate_key(&self, k: Key<'r>, from: &Bump) -> Key<'r> {
+    fn evacuate_key(&self, k: Key<'r>, from: &Gone<'_>) -> Key<'r> {
         match k {
-            Key::Str(s) if holds(from, s.as_ptr()) => Key::Str(self.cur().alloc_slice_copy(s)),
+            Key::Str(s) if from.holds(s.as_ptr()) => Key::Str(self.cur().alloc_slice_copy(s)),
             k => k,
         }
     }
 
     /// Lets a returned call's block go.
-    fn drop_block(&mut self, block: Box<Bump>) {
+    fn drop_block(&mut self, block: Box<Bump>, big: Vec<Vec<u8>>) {
         #[cfg(feature = "poison")]
         {
+            let mut big = big;
+            for b in &mut big {
+                b.fill(0xA5);
+            }
+            self.poisoned_big.extend(big);
             // SAFETY: the chunks are the block's own memory, which nothing reads any more; they
             // are overwritten through the block's raw pointers and kept until the request ends.
             for (p, len) in unsafe { block.iter_allocated_chunks_raw() } {
@@ -304,7 +364,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
             self.poisoned.push(block);
         }
         #[cfg(not(feature = "poison"))]
-        drop(block);
+        drop((block, big));
     }
 
     fn new_scope(&self) -> &'r Scope<'r> {
@@ -410,6 +470,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                     ));
                 };
                 share(v);
+                self.lend(v);
                 self.stack.push(v);
             }
             Op::LoadQuiet(n) => {
@@ -421,6 +482,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                     .copied()
                     .unwrap_or(Value::Null);
                 share(v);
+                self.lend(v);
                 self.stack.push(v);
             }
             Op::Store(n) => {
@@ -556,7 +618,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                     rest.extend_from_slice(to_bytes(self.cur(), self.stack[k], line)?);
                     string_fits(rest.len(), line)?;
                 }
-                let joined = self.concat(first, &rest, line)?;
+                let joined = self.concat(first, &rest, line, false, false)?;
                 for k in at..self.stack.len() {
                     release(self.stack[k]);
                 }
@@ -581,7 +643,8 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                             to_bytes(self.cur(), a, line)?,
                             to_bytes(self.cur(), b, line)?,
                         );
-                        Value::Str(self.concat(x, y, line)?)
+                        // The variable is read here, not loaded: it alone holds what it held.
+                        Value::Str(self.concat(x, y, line, true, true)?)
                     }
                     op => self.binary(op, a, b, line)?,
                 };
@@ -591,6 +654,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                 }
                 if keep {
                     share(r);
+                    self.lend(r);
                     self.stack.push(r);
                 }
             }
@@ -908,18 +972,144 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
         Ok(())
     }
 
-    /// `left` and then `right`, as one string of its own length.
-    fn concat(&self, left: &[u8], right: &[u8], line: u32) -> Result<&'r [u8], Refusal> {
+    /// The growing strings of the block what is made now goes into.
+    fn tails(&mut self) -> &mut Tails {
+        match self.call_tails.last_mut() {
+            Some(t) => t,
+            None => &mut self.tails,
+        }
+    }
+
+    /// A value now held besides its variable: the buffer of a growing string it holds may no
+    /// longer move.
+    fn lend(&mut self, v: Value<'r>) {
+        if let Value::Str(s) = v
+            && !s.is_empty()
+            && let Some(g) = self.tails().map.get_mut(&(s.as_ptr() as usize + s.len()))
+        {
+            g.lent = true;
+        }
+    }
+
+    /// `left` and then `right`, as one string. Where `left` ends where a growing buffer's bytes
+    /// end, `right` is written after it: in place if the buffer has room; moving the buffer as it
+    /// grows where `left` is read from the variable that alone holds it (`owned`); and otherwise
+    /// in a new buffer twice the length. `.=` (`grow`) starts such a buffer. Any other
+    /// concatenation makes a string of its own length.
+    fn concat(
+        &mut self,
+        left: &'r [u8],
+        right: &[u8],
+        line: u32,
+        grow: bool,
+        owned: bool,
+    ) -> Result<&'r [u8], Refusal> {
         let len = left.len() + right.len();
         string_fits(len, line)?;
-        let mut out = BVec::with_capacity_in(len, self.cur());
-        out.extend_from_slice(left);
-        out.extend_from_slice(right);
-        Ok(out.into_bump_slice())
+        let bump = self.cur();
+        let tails = self.tails();
+        let end = left.as_ptr() as usize + left.len();
+        let growing = if left.is_empty() {
+            None
+        } else {
+            tails.map.remove(&end)
+        };
+        if let Some(g) = growing {
+            let from = left.as_ptr() as usize - g.start as usize;
+            match g.big {
+                Some(i) => {
+                    let room = tails.big[i].capacity() - tails.big[i].len();
+                    if room >= right.len() || (owned && !g.lent) {
+                        #[cfg(feature = "poison")]
+                        if room < right.len() {
+                            // Under `poison` a buffer that moves is overwritten and kept, so a
+                            // value still holding it reads a wrong page.
+                            let mut moved =
+                                Vec::with_capacity((2 * len).max(tails.big[i].capacity()));
+                            moved.extend_from_slice(&tails.big[i]);
+                            let mut old = std::mem::replace(&mut tails.big[i], moved);
+                            old.fill(0xA5);
+                            tails.big.push(old);
+                        }
+                        let buf = &mut tails.big[i];
+                        buf.extend_from_slice(right);
+                        let start = buf.as_mut_ptr();
+                        tails.map.insert(
+                            start as usize + buf.len(),
+                            Grow {
+                                start,
+                                room_end: 0,
+                                big: Some(i),
+                                lent: g.lent,
+                            },
+                        );
+                        // SAFETY: `left` lay `from` bytes into the buffer, which now holds it
+                        // and `right` after it; a buffer that moved was held by no other value.
+                        return Ok(unsafe { std::slice::from_raw_parts(start.add(from), len) });
+                    }
+                }
+                None if g.room_end - end >= right.len() => {
+                    // SAFETY: `start` is the buffer's own pointer, `left` lies in the buffer, and
+                    // the bytes from `end` to `room_end` are its room, which no value holds.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            right.as_ptr(),
+                            g.start.add(from + left.len()),
+                            right.len(),
+                        );
+                    }
+                    tails.map.insert(end + right.len(), g);
+                    return Ok(unsafe { std::slice::from_raw_parts(g.start.add(from), len) });
+                }
+                None => {}
+            }
+        }
+        let grows = growing.is_some() || grow;
+        let room = if grows {
+            (2 * len).clamp(32, STRING_LIMIT).max(len)
+        } else {
+            len
+        };
+        if grows && room >= BIG {
+            let mut buf = Vec::with_capacity(room);
+            buf.extend_from_slice(left);
+            buf.extend_from_slice(right);
+            let start = buf.as_mut_ptr();
+            tails.big.push(buf);
+            let big = Some(tails.big.len() - 1);
+            tails.map.insert(
+                start as usize + len,
+                Grow {
+                    start,
+                    room_end: 0,
+                    big,
+                    lent: false,
+                },
+            );
+            // SAFETY: the buffer is the block's, and holds the string's `len` bytes.
+            return Ok(unsafe { std::slice::from_raw_parts(start, len) });
+        }
+        let buf = bump.alloc_slice_fill_copy(room, 0u8);
+        buf[..left.len()].copy_from_slice(left);
+        buf[left.len()..len].copy_from_slice(right);
+        let start = buf.as_mut_ptr();
+        if grows {
+            tails.map.insert(
+                start as usize + len,
+                Grow {
+                    start,
+                    room_end: start as usize + room,
+                    big: None,
+                    lent: false,
+                },
+            );
+        }
+        // SAFETY: the first `len` bytes of the buffer were just written.
+        Ok(unsafe { std::slice::from_raw_parts(start, len) })
     }
 
     fn binary(
-        &self,
+        &mut self,
         op: BinOp,
         a: Value<'r>,
         b: Value<'r>,
@@ -961,7 +1151,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                     to_bytes(self.cur(), a, line)?,
                     to_bytes(self.cur(), b, line)?,
                 );
-                Value::Str(self.concat(x, y, line)?)
+                Value::Str(self.concat(x, y, line, false, false)?)
             }
             BinOp::Equal => Value::Bool(loose_equal(a, b, line)?),
             BinOp::NotEqual => Value::Bool(!loose_equal(a, b, line)?),
@@ -1040,6 +1230,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                 ));
             }
             self.blocks.push(Box::new(Bump::new()));
+            self.call_tails.push(Tails::default());
             self.calls += 1;
             self.live_calls += 1;
             let scope = self.new_scope();
@@ -1107,10 +1298,18 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                 release(held);
             }
             self.live_calls -= 1;
+            let tails = self.call_tails.pop().expect("the call's strings");
             let block = self.blocks.pop().expect("the call's block");
-            let v = self.evacuate(v, &block);
-            self.block_bytes_max = self.block_bytes_max.max(block.allocated_bytes());
-            self.drop_block(block);
+            let v = self.evacuate(
+                v,
+                &Gone {
+                    block: &block,
+                    big: &tails.big,
+                },
+            );
+            let big: usize = tails.big.iter().map(|b| b.capacity()).sum();
+            self.block_bytes_max = self.block_bytes_max.max(block.allocated_bytes() + big);
+            self.drop_block(block, tails.big);
             v
         } else {
             v

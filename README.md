@@ -107,7 +107,7 @@ refuses the page.
   which runs other requests meanwhile. The page so far goes out at each wait.
 - **Nothing a request made outlives it.** What a request makes is let go all at once when its
   page has gone out, and what a call makes, when the call returns, so requests share nothing but
-  the kept pages.
+  the kept pages. A string built with `.=` grows in place, and stays near its own length.
 - **whp stops where PHP's memory would.** Under its default `memory_limit` of 128M, PHP cannot
   hold a string of 128 MiB or more, an array of more than 4,194,304 elements, or 915,135 calls at
   once. whp refuses a page that reaches one of these, and goes on serving the others.
@@ -225,8 +225,8 @@ a wrong argument, or a directory it cannot serve.
   stack's worker threads); `whp serve` gains `--workers W`; and both take `--round <file.jsonl>`,
   one JSON line a request: how often the stack polled it, its waits, the files it read, its heap
   at the peak, the bytes of its blocks, its calls, and its page's bytes.
-- **`poison`** overwrites the memory of a call that has returned, and keeps it, so a page that
-  read it afterwards would come out wrong. It is for testing.
+- **`poison`** overwrites the memory of a call that has returned, and of a string that has moved,
+  and keeps it, so a page that read either one afterwards would come out wrong. It is for testing.
 
 ### Tests
 
