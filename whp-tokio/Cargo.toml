@@ -22,4 +22,4 @@ poison = ["whp/poison"]
 
 [dependencies]
 whp = { path = "../whp", version = "0.0.1" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

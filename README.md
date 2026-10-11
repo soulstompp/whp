@@ -7,9 +7,11 @@ page goes out, and everything the request made is thrown away. Every page whp ru
 bytes. A page that uses something whp does not run yet is refused, with what whp met and the line
 it met it on; whp never runs a page differently.
 
-whp is a Rust library and a command. The library does no I/O of its own: a host keeps the
-compiled pages and gives each request somewhere to write its page. The `whp` command is one such
-host, on the tokio stack.
+What changes is for Rust developers. A request in whp is an iterator over its waits: it runs until
+it must sleep or load a page, hands that wait back, and goes on when it is resumed. whp does no
+I/O of its own, so the timer, the loader, the store and the runtime are whichever Rust libraries
+suit you. The `whp` command is one such host, on the tokio stack, where a request that waits gives
+its thread to other requests.
 
 ## Install
 
@@ -75,7 +77,8 @@ whp runs this much of PHP today, and refuses the rest:
 - The constants `true`, `false`, `null`, `PHP_EOL`, `PHP_INT_MAX`, `PHP_INT_MIN`,
   `PHP_INT_SIZE`, `__DIR__`, `__FILE__` and `__LINE__`.
 - The functions `count`, `strlen`, `implode`, `str_repeat`, `htmlspecialchars` (with PHP 8's
-  default flags), `array_keys`, `in_array`, `is_int`, `is_string` and `intdiv`.
+  default flags), `array_keys`, `in_array`, `is_int`, `is_string`, `intdiv`, `sleep` and
+  `usleep`.
 
 Refused today: floats, classes and objects, closures and arrow functions, generators, references,
 exceptions, `switch`, namespaces and `use`, `static` and `global`, casts, bitwise operators, the
@@ -90,6 +93,9 @@ refuses the page.
 - **A page is compiled once.** The first request that asks for a page reads and compiles it, and
   whp keeps it for as long as the process runs. Every later request runs the kept page and reads
   nothing from the disk, so a page whose file changes is read again only when whp starts again.
+- **A request gives its thread back while it waits.** At `sleep()`, at `usleep()`, and at an
+  include of a page not yet kept, the request stops and hands its thread back to the tokio stack,
+  which runs other requests meanwhile. The page so far goes out at each wait.
 - **Nothing a request made outlives it.** What a request makes is let go all at once when its
   page has gone out, and what a call makes, when the call returns, so requests share nothing but
   the kept pages.
@@ -97,21 +103,28 @@ refuses the page.
   hold a string of 128 MiB or more, an array of more than 4,194,304 elements, or 915,135 calls at
   once. whp refuses a page that reaches one of these.
 
-## Using the library
+## A request is an iterator over its waits
 
-The `whp` crate, the library under the command, compiles pages and runs requests, and does no I/O
-of its own:
+In PHP a request runs to its end inside the engine, which blocks at every `sleep()` and at every
+page it loads. In whp you hold the request. The `whp` crate, the library under the command,
+compiles pages and runs requests, and does no I/O of its own:
 
 - a `Store` keeps the compiled pages: in a map, on a disk, behind a cache, wherever you keep
   them;
-- `whp::run` runs one request to its end, writing its page to any `std::io::Write`, and gives back
-  an `Outcome`: the bytes of the page, of its blocks, and its calls; a page whp will not run gives
-  a `Refusal`, with what whp met, the page and the line.
+- `Request::resume` runs the request until it ends or must wait, writing its page to any
+  `std::io::Write`, and gives back a `Step`: `Done`, or `Wait` with what it waits on;
+- for a `Wait::Sleep`, you sleep, with any timer; for a `Wait::Page`, you load the page, with any
+  loader, hand it over with `Request::loaded`, and resume; a page that cannot be loaded is refused
+  at the include that asked for it, by `Request::failed`;
+- `Step::Done` carries an `Outcome`: the bytes of the page, of its blocks, and its calls; a page
+  whp will not run gives a `Refusal`, with what whp met, the page and the line;
+- the request owns everything it made, so it moves between threads whole while it waits.
 
-A host with one page:
+So any part of the host can be replaced with a better Rust library, and the page still gives
+PHP's bytes. A host that does the waits in the simplest way:
 
 ```rust
-use whp::{Page, Refusal, Store, compile_page};
+use whp::{Page, Refusal, Request, Step, Store, Wait, compile_page};
 
 /// A store holding one page, kept from the start.
 struct One(&'static Page);
@@ -129,11 +142,23 @@ let source = b"<p><?= 'Hello, ' . 'world' ?></p>\n";
 let page: &'static Page = Box::leak(Box::new(compile_page(b"/hello.php", source).unwrap()));
 let store = One(page);
 let mut out = Vec::new();
-whp::run(&store, page, &mut out).unwrap();
+let mut request = Request::new(&store, page);
+loop {
+    match request.resume(&mut out).unwrap() {
+        Step::Done(_) => break,
+        Step::Wait(Wait::Sleep(time)) => std::thread::sleep(time),
+        Step::Wait(Wait::Page { path, from_dir }) => {
+            let loaded = store.load(&path, &from_dir).map_err(|r| request.failed(r));
+            request.loaded(loaded.unwrap());
+        }
+    }
+}
 assert_eq!(out, b"<p>Hello, world</p>\n");
 ```
 
-The `whp-tokio` crate is the host on the tokio stack, and the source of the `whp` command.
+`whp::run` drives one request to its end on the calling thread. The `whp-tokio` crate is the host
+on the tokio stack, and the source of the `whp` command: each wait is an await there, so a
+request that waits gives its thread to other requests.
 
 ## Next: iterators and plugins in Rust
 
@@ -173,9 +198,10 @@ a wrong argument.
 ### Features
 
 - **`round`** counts what each request does. `whp run` gains `--repeat N` (N requests, one after
-  another) and `--round <file.jsonl>`, one JSON line a request: how often the stack polled it,
-  the files it read, its heap at the peak, the bytes of its blocks, its calls, and its page's
-  bytes.
+  another), `--concurrent N` (then N at once, each giving the same page), `--workers W` (the
+  stack's worker threads) and `--round <file.jsonl>`, one JSON line a request: how often the stack
+  polled it, its waits, the files it read, its heap at the peak, the bytes of its blocks, its
+  calls, and its page's bytes.
 - **`poison`** overwrites the memory of a call that has returned, and keeps it, so a page that
   read it afterwards would come out wrong. It is for testing.
 

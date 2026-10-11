@@ -1,18 +1,20 @@
 // Copyright (C) 2026 Kenneth Allen Flegal and DappleAI
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The round's counters, read around each request: the polls the stack gave its task, the files
-//! the store read and the bytes the process read, and the heap the request's task held and left
-//! behind.
+//! The round's counters, read around each request: the polls the stack gave its task and the
+//! waits it made, the files the store read and the bytes the process read, the heap the request's
+//! task held and left behind, and when it started and ended.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use crate::Args;
 use crate::host;
@@ -111,7 +113,9 @@ impl<F: Future> Future for Counted<F> {
 #[derive(Debug, Default, Clone)]
 pub struct Row {
     pub request: u64,
+    pub batch: u64,
     pub polls: u32,
+    pub waits: u64,
     pub page_reads: u64,
     pub page_bytes: u64,
     pub rchar: i64,
@@ -122,8 +126,11 @@ pub struct Row {
     pub calls: u64,
     pub call_block_max: u64,
     pub process_live_after: i64,
+    pub threads: i64,
     pub workers: u64,
     pub teardown_waits: u64,
+    pub started_us: u64,
+    pub ended_us: u64,
     pub refused: bool,
 }
 
@@ -138,43 +145,74 @@ fn rchar() -> (i64, i64) {
     (n, text.len() as i64)
 }
 
-/// One request on its own task, writing its page to stdout, its row read around it.
+/// The process's threads: the stack's workers and the blocking threads it keeps, which it lets go
+/// once they have idled long enough.
+fn threads() -> i64 {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(-1)
+}
+
+/// One request on its own task, its row read around it. A request run alone writes to stdout and
+/// reads the process's bytes; one among others keeps its page to compare, and cannot read the
+/// process's bytes, which the others read at the same time.
 async fn request(
     store: &'static FileStore,
     page: &'static str,
     n: u64,
-) -> (Result<(), whp::Refusal>, Row) {
+    batch: u64,
+    alone: bool,
+    t0: Instant,
+) -> (Result<Vec<u8>, whp::Refusal>, Row) {
     let polls = Arc::new(AtomicU32::new(0));
     let count = Arc::new(TaskCount::default());
     let task_count = count.clone();
     let task = Counted {
         inner: Box::pin(async move {
+            let started = t0.elapsed().as_micros() as u64;
             let (reads0, bytes0) = store.reads();
-            let (rchar0, read_len) = rchar();
+            let (rchar0, read_len) = if alone { rchar() } else { (0, 0) };
             let live0 = task_count.live.load(Ordering::Relaxed);
             task_count.peak.store(live0, Ordering::Relaxed);
-            let mut out = std::io::BufWriter::new(std::io::stdout());
-            let result = host::page(store, page, &mut out);
-            drop(out);
+            let mut kept_out = Vec::new();
+            let result = if alone {
+                let mut out = std::io::BufWriter::new(std::io::stdout());
+                host::page(store, page, &mut out).await
+            } else {
+                host::page(store, page, &mut kept_out).await
+            };
             let live1 = task_count.live.load(Ordering::Relaxed);
             let peak = task_count.peak.load(Ordering::Relaxed);
-            let (rchar1, _) = rchar();
+            let (rchar1, _) = if alone { rchar() } else { (0, 0) };
             let (reads1, bytes1) = store.reads();
             let row = Row {
                 request: n,
+                batch,
+                waits: result.as_ref().map_or(0, |s| s.waits),
                 page_reads: reads1 - reads0,
                 page_bytes: bytes1 - bytes0,
-                rchar: rchar1 - rchar0 - read_len,
+                rchar: if alone {
+                    rchar1 - rchar0 - read_len
+                } else {
+                    -1
+                },
                 kept_bytes: (live1 - live0) as i64,
                 peak_bytes: (peak - live0) as i64,
-                block_bytes: result.as_ref().map_or(0, |o| o.block_bytes as u64),
-                out_bytes: result.as_ref().map_or(0, |o| o.out_bytes),
-                calls: result.as_ref().map_or(0, |o| o.calls),
-                call_block_max: result.as_ref().map_or(0, |o| o.call_block_max as u64),
+                block_bytes: result.as_ref().map_or(0, |s| s.outcome.block_bytes as u64),
+                out_bytes: result.as_ref().map_or(0, |s| s.outcome.out_bytes),
+                calls: result.as_ref().map_or(0, |s| s.outcome.calls),
+                call_block_max: result
+                    .as_ref()
+                    .map_or(0, |s| s.outcome.call_block_max as u64),
                 refused: result.is_err(),
+                started_us: started,
+                ended_us: t0.elapsed().as_micros() as u64,
                 ..Row::default()
             };
-            (result.map(|_| ()), row)
+            (result.map(|_| kept_out), row)
         }),
         polls: polls.clone(),
         count,
@@ -193,6 +231,8 @@ async fn settle(row: &mut Row) {
         waits += 1;
         tokio::task::yield_now().await;
     }
+    // Read before the heap, so what reading them takes is freed again.
+    row.threads = threads();
     row.process_live_after = LIVE.load(Ordering::Relaxed) as i64;
     row.workers = m.num_workers() as u64;
     row.teardown_waits = waits;
@@ -204,15 +244,42 @@ pub async fn drive(
     page: &'static str,
     args: &Args,
 ) -> Result<(), whp::Refusal> {
-    let mut rows = Vec::with_capacity(args.repeat as usize);
+    let t0 = Instant::now();
+    let mut rows = Vec::with_capacity((args.repeat + args.concurrent) as usize);
     let mut failed = None;
     for n in 0..args.repeat {
-        let (result, mut row) = request(store, page, n).await;
+        let (result, mut row) = request(store, page, n, 0, true, t0).await;
         settle(&mut row).await;
         rows.push(row);
         if let Err(r) = result {
             failed = Some(r);
             break;
+        }
+    }
+    if args.concurrent > 0 && failed.is_none() {
+        let handles: Vec<_> = (0..args.concurrent)
+            .map(|n| tokio::spawn(request(store, page, n, 1, false, t0)))
+            .collect();
+        let mut first: Option<Vec<u8>> = None;
+        for h in handles {
+            let (result, row) = h.await.expect("the batch's task");
+            rows.push(row);
+            match result {
+                Ok(bytes) => match &first {
+                    None => first = Some(bytes),
+                    Some(f) if *f != bytes => {
+                        failed = Some(whp::Refusal::at(
+                            "two requests at once gave different pages",
+                            0,
+                        ));
+                    }
+                    Some(_) => {}
+                },
+                Err(r) => failed = Some(r),
+            }
+        }
+        if let Some(bytes) = first {
+            let _ = std::io::stdout().write_all(&bytes);
         }
     }
     if let Some(file) = &args.round {
@@ -230,9 +297,11 @@ fn write(file: &str, rows: &[Row]) -> std::io::Result<()> {
     for r in rows {
         let _ = writeln!(
             s,
-            "{{\"request\":{},\"polls\":{},\"page_reads\":{},\"page_bytes\":{},\"rchar\":{},\"kept_bytes\":{},\"peak_bytes\":{},\"block_bytes\":{},\"out_bytes\":{},\"calls\":{},\"call_block_max\":{},\"process_live_after\":{},\"workers\":{},\"teardown_waits\":{},\"refused\":{}}}",
+            "{{\"request\":{},\"batch\":{},\"polls\":{},\"waits\":{},\"page_reads\":{},\"page_bytes\":{},\"rchar\":{},\"kept_bytes\":{},\"peak_bytes\":{},\"block_bytes\":{},\"out_bytes\":{},\"calls\":{},\"call_block_max\":{},\"process_live_after\":{},\"threads\":{},\"workers\":{},\"teardown_waits\":{},\"started_us\":{},\"ended_us\":{},\"refused\":{}}}",
             r.request,
+            r.batch,
             r.polls,
+            r.waits,
             r.page_reads,
             r.page_bytes,
             r.rchar,
@@ -243,8 +312,11 @@ fn write(file: &str, rows: &[Row]) -> std::io::Result<()> {
             r.calls,
             r.call_block_max,
             r.process_live_after,
+            r.threads,
             r.workers,
             r.teardown_waits,
+            r.started_us,
+            r.ended_us,
             r.refused
         );
     }

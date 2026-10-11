@@ -13,6 +13,8 @@ pub trait Store {
     /// kept page lives as long as the process.
     fn kept(&self, path: &[u8], from_dir: &[u8]) -> Option<&'static Page>;
 
-    /// Reads and compiles the page, and keeps it if the store keeps pages.
+    /// Reads and compiles the page, and keeps it if the store keeps pages. It may wait on the
+    /// disk, so a host calls it where a thread may wait: a request that needs a page not kept
+    /// hands the host a wait for it, and the host hands the request the page this gives back.
     fn load(&self, path: &[u8], from_dir: &[u8]) -> Result<&'static Page, Refusal>;
 }

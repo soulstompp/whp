@@ -7,9 +7,11 @@
 //!
 //! PHP's frames are kept in the request's block, never on Rust's stack: a call pushes a frame and
 //! a return pops one, so a page may call as deep as its memory allows, and the request's state is
-//! all in the machine at every instruction.
+//! all in the machine at every instruction. So a request stops at any instruction that must wait,
+//! hands its host what it waits on, and resumes there.
 
 use std::io::Write;
+use std::time::Duration;
 
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BVec;
@@ -38,23 +40,108 @@ pub struct Outcome {
     pub call_block_max: usize,
 }
 
-/// Runs `entry` as one request to its end, writing its page to `sink`. A page an include asks for
-/// comes from the store.
+/// What a request waits on before it can go on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wait {
+    /// `sleep()` or `usleep()`: the request waits this long.
+    Sleep(Duration),
+    /// A page the store has not kept: the host loads it ([`Store::load`]), hands it to the
+    /// request ([`Request::loaded`]), and resumes the request, which includes it.
+    Page {
+        /// The page's path, as the page that includes it writes it.
+        path: Vec<u8>,
+        /// The directory of the page that includes it.
+        from_dir: Vec<u8>,
+    },
+}
+
+/// Where a request stands after it ran: waiting, or done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// It waits on this; its page so far has gone to the sink.
+    Wait(Wait),
+    /// It ended, its whole page gone to the sink.
+    Done(Outcome),
+}
+
+/// One request, which its host drives: [`Request::resume`] runs it until it ends or must wait.
+/// The request owns everything it has made, so it moves whole between threads while it waits.
+pub struct Request<'s, S: Store + ?Sized> {
+    // The machine borrows the block, so it is declared first, and dropped first.
+    machine: Machine<'static, 's, S>,
+    block: Box<Bump>,
+}
+
+// SAFETY: every reference inside a request points into its own blocks, which move with it, into a
+// page kept for the life of the process, which is never written, or at the store, which is Sync.
+// No reference into a request's blocks is ever handed out of it.
+unsafe impl<S: Store + Sync + ?Sized> Send for Request<'_, S> {}
+
+impl<'s, S: Store + ?Sized> Request<'s, S> {
+    /// A request for `entry`, which its host has fetched.
+    pub fn new(store: &'s S, entry: &'static Page) -> Self {
+        let block = Box::new(Bump::new());
+        // SAFETY: the block is boxed, so it stays put, and the request drops the machine before
+        // the block; nothing made in it leaves the request.
+        let request: &'static Bump = unsafe { &*(&*block as *const Bump) };
+        let mut machine = Machine::new(request, store);
+        machine.start(entry);
+        Request { machine, block }
+    }
+
+    /// Runs the request on from where it stopped, writing its page to `sink`, until it ends or
+    /// must wait.
+    pub fn resume(&mut self, sink: &mut dyn Write) -> Result<Step, Refusal> {
+        match self.machine.run(sink)? {
+            Some(wait) => Ok(Step::Wait(wait)),
+            None => Ok(Step::Done(Outcome {
+                out_bytes: self.machine.out_bytes,
+                block_bytes: self.block.allocated_bytes(),
+                calls: self.machine.calls,
+                call_block_max: self.machine.block_bytes_max,
+            })),
+        }
+    }
+
+    /// Hands the request the page it waited on, which its include runs when it resumes. The
+    /// request never asks the store for it again, so a store need not keep what it loads.
+    pub fn loaded(&mut self, page: &'static Page) {
+        self.machine.loaded = Some(page);
+    }
+
+    /// A refusal met while the host did what the request waited on, such as a page it could not
+    /// load, placed at the request's include.
+    pub fn failed(&self, r: Refusal) -> Refusal {
+        match self.machine.waiting_at {
+            Some((path, line)) if r.line == 0 && r.file.is_empty() => Refusal {
+                line,
+                ..r.in_file(path)
+            },
+            _ => r,
+        }
+    }
+}
+
+/// Runs `entry` as one request to its end, writing its page to `sink`: each sleep blocks the
+/// thread, and each page is loaded where the request waits for it.
 pub fn run<S: Store + ?Sized>(
     store: &S,
     entry: &'static Page,
     sink: &mut dyn Write,
 ) -> Result<Outcome, Refusal> {
-    let block = Bump::new();
-    let mut machine = Machine::new(&block, store);
-    machine.start(entry);
-    machine.run(sink)?;
-    Ok(Outcome {
-        out_bytes: machine.out_bytes,
-        block_bytes: block.allocated_bytes(),
-        calls: machine.calls,
-        call_block_max: machine.block_bytes_max,
-    })
+    let mut request = Request::new(store, entry);
+    loop {
+        match request.resume(sink)? {
+            Step::Done(outcome) => return Ok(outcome),
+            Step::Wait(Wait::Sleep(d)) => std::thread::sleep(d),
+            Step::Wait(Wait::Page { path, from_dir }) => {
+                let page = store
+                    .load(&path, &from_dir)
+                    .map_err(|r| request.failed(r))?;
+                request.loaded(page);
+            }
+        }
+    }
 }
 
 /// Whether `p` points into memory `block` has handed out.
@@ -104,6 +191,7 @@ struct Walk<'r> {
 enum Flow {
     Go,
     Done,
+    Wait(Wait),
 }
 
 struct Machine<'r, 's, S: Store + ?Sized> {
@@ -129,6 +217,10 @@ struct Machine<'r, 's, S: Store + ?Sized> {
     included: HashSet<&'static [u8], DefaultHashBuilder, &'r Bump>,
     /// Whether the entry page has been declared: its first run does it.
     started: bool,
+    /// The page the host loaded while the request waited, for the include that waited on it.
+    loaded: Option<&'static Page>,
+    /// The page and line of the include the request waits at.
+    waiting_at: Option<(&'static [u8], u32)>,
 }
 
 fn lit<'r>(l: &'static Lit) -> Value<'r> {
@@ -158,6 +250,8 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
             functions: HashMap::with_hasher_in(DefaultHashBuilder::default(), bump),
             included: HashSet::with_hasher_in(DefaultHashBuilder::default(), bump),
             started: false,
+            loaded: None,
+            waiting_at: None,
         }
     }
 
@@ -269,8 +363,8 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
         });
     }
 
-    /// Runs the request to its end.
-    fn run(&mut self, sink: &mut dyn Write) -> Result<(), Refusal> {
+    /// Runs on until the request ends (none) or must wait.
+    fn run(&mut self, sink: &mut dyn Write) -> Result<Option<Wait>, Refusal> {
         if !self.started {
             self.started = true;
             let entry = self.frames[0].page;
@@ -279,14 +373,15 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
         }
         loop {
             let Some(&f) = self.frames.last() else {
-                return Ok(());
+                return Ok(None);
             };
             let op = f.code.ops[f.pc];
             let line = f.code.lines[f.pc];
             self.frame().pc += 1;
             match self.step(op, f, line, sink) {
                 Ok(Flow::Go) => {}
-                Ok(Flow::Done) => return Ok(()),
+                Ok(Flow::Done) => return Ok(None),
+                Ok(Flow::Wait(w)) => return Ok(Some(w)),
                 Err(r) => return Err(r.in_file(&f.page.path)),
             }
         }
@@ -534,7 +629,11 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                     self.frame().pc = t as usize;
                 }
             }
-            Op::Call { name: n, argc } => self.call(name(n), argc as usize, line)?,
+            Op::Call { name: n, argc } => {
+                if let Some(w) = self.call(name(n), argc as usize, line)? {
+                    return Ok(Flow::Wait(w));
+                }
+            }
             Op::Return => return self.ret(),
             Op::NewArray => self.stack.push(Value::Array(Array::new(self.cur()))),
             Op::ArrayPush => {
@@ -599,16 +698,18 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
             }
             Op::Include(kind) => {
                 let path = to_bytes(self.cur(), self.top(), line)?;
-                let page = match self.store.kept(path, &f.page.dir) {
-                    Some(page) => page,
-                    // A page that cannot be loaded is refused at the include that asked for it.
-                    None => self.store.load(path, &f.page.dir).map_err(|r| {
-                        if r.line == 0 && r.file.is_empty() {
-                            Refusal { line, ..r }
-                        } else {
-                            r
-                        }
-                    })?,
+                let Some(page) = self
+                    .loaded
+                    .take()
+                    .or_else(|| self.store.kept(path, &f.page.dir))
+                else {
+                    // The page is loaded while the request waits; then this include runs again.
+                    self.frame().pc -= 1;
+                    self.waiting_at = Some((&f.page.path, line));
+                    return Ok(Flow::Wait(Wait::Page {
+                        path: path.to_vec(),
+                        from_dir: f.page.dir.to_vec(),
+                    }));
                 };
                 let p = self.pop();
                 release(p);
@@ -886,7 +987,41 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
         })
     }
 
-    fn call(&mut self, key: &'static [u8], argc: usize, line: u32) -> Result<(), Refusal> {
+    /// `sleep(seconds)` and `usleep(microseconds)`: PHP's own functions that wait. Each pushes
+    /// what it gives back (0, and null) and hands the wait to the host; a sleep of no time is
+    /// no wait.
+    fn wait(&mut self, key: &[u8], argc: usize, line: u32) -> Result<Option<Wait>, Refusal> {
+        let micros_per = if key == b"sleep" { 1_000_000 } else { 1 };
+        let name = String::from_utf8_lossy(key);
+        if argc != 1 {
+            return Err(Refusal::at(format!("{name}() with {argc} arguments"), line));
+        }
+        let v = self.pop();
+        release(v);
+        let Value::Int(n) = v else {
+            return Err(Refusal::at(
+                format!("{name}() given something other than an int"),
+                line,
+            ));
+        };
+        let micros = u64::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_mul(micros_per))
+            .ok_or_else(|| Refusal::at(format!("{name}() given a negative time"), line))?;
+        self.stack.push(if key == b"sleep" {
+            Value::Int(0)
+        } else {
+            Value::Null
+        });
+        Ok((micros > 0).then(|| Wait::Sleep(Duration::from_micros(micros))))
+    }
+
+    fn call(
+        &mut self,
+        key: &'static [u8],
+        argc: usize,
+        line: u32,
+    ) -> Result<Option<Wait>, Refusal> {
         let at = self.stack.len() - argc;
         if let Some(&(page, func)) = self.functions.get(key) {
             if argc < func.required {
@@ -930,7 +1065,10 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                 walks,
                 kind: FrameKind::Function,
             });
-            return Ok(());
+            return Ok(None);
+        }
+        if builtins::waits(key) {
+            return self.wait(key, argc, line);
         }
         let Some(builtin) = builtins::find(key) else {
             return Err(Refusal::at(
@@ -948,7 +1086,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
             release(a);
         }
         self.stack.push(r);
-        Ok(())
+        Ok(None)
     }
 
     /// Leaves the current frame with the value on top of its stack. Gives back whether the

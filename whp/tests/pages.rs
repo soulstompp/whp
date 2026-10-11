@@ -51,6 +51,31 @@ impl Store for Files {
     }
 }
 
+/// A store that keeps nothing: every include waits for its page, which is read again. It refuses
+/// once it has loaded more pages than the corpus could ask for, so a request that asks for the
+/// same page forever fails instead of running on.
+#[derive(Default)]
+struct Forgetful {
+    files: Files,
+    loads: std::sync::atomic::AtomicU64,
+}
+
+impl Store for Forgetful {
+    fn kept(&self, _path: &[u8], _from_dir: &[u8]) -> Option<&'static Page> {
+        None
+    }
+
+    fn load(&self, path: &[u8], from_dir: &[u8]) -> Result<&'static Page, Refusal> {
+        let n = self
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n >= 10_000 {
+            return Err(Refusal::at("the same page asked for over and over", 0));
+        }
+        self.files.load(path, from_dir)
+    }
+}
+
 fn corpus() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../tests/pages")
@@ -61,6 +86,11 @@ fn corpus() -> PathBuf {
 #[test]
 fn every_page_gives_phps_bytes() {
     every_page_on(&Files::default());
+}
+
+#[test]
+fn every_page_runs_on_a_store_that_keeps_nothing() {
+    every_page_on(&Forgetful::default());
 }
 
 fn every_page_on(store: &impl Store) {

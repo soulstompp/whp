@@ -48,6 +48,12 @@ pub fn find(name: &[u8]) -> Option<Builtin> {
     })
 }
 
+/// Whether PHP has a function by this lowercased name that waits, which the request hands to
+/// its host instead of running.
+pub fn waits(name: &[u8]) -> bool {
+    matches!(name, b"sleep" | b"usleep")
+}
+
 fn arity(args: &[Value<'_>], min: usize, max: usize, name: &str, line: u32) -> Result<(), Refusal> {
     if args.len() < min || args.len() > max {
         return Err(Refusal::at(

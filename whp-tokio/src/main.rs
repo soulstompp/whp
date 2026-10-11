@@ -6,8 +6,10 @@
 //! `whp` exits 0 when the page went out whole, 3 when whp refused it (the refusal, its page and
 //! its line, on stderr), and 2 when it could not start: a wrong argument.
 //!
-//! Built with the `round` feature, `run` also takes `--repeat N`, N requests one after another,
-//! and `--round <file>`, one JSON line a request saying what the stack and the request did.
+//! Built with the `round` feature, `run` also takes `--repeat N`, N requests one after another;
+//! `--concurrent N`, one request and then N at once, each of which must give the same bytes;
+//! `--workers W`, the stack's worker threads; and `--round <file>`, one JSON line a request saying
+//! what the stack and the request did.
 
 mod host;
 mod store;
@@ -24,6 +26,8 @@ const REFUSED: u8 = 3;
 pub struct Args {
     pub page: String,
     pub repeat: u64,
+    pub concurrent: u64,
+    pub workers: Option<usize>,
     pub round: Option<String>,
 }
 
@@ -31,7 +35,9 @@ fn usage() -> ExitCode {
     eprintln!("usage: whp run <page.php>");
     #[cfg(feature = "round")]
     {
-        eprintln!("       whp run <page.php> [--repeat N] [--round <file.jsonl>]");
+        eprintln!(
+            "       whp run <page.php> [--repeat N] [--concurrent N] [--workers W] [--round <file.jsonl>]"
+        );
     }
     eprintln!(
         "exits 0 when the page went out whole, 3 when whp refused it, 2 when it cannot start"
@@ -48,12 +54,18 @@ fn args() -> Option<Args> {
             let mut a = Args {
                 page: String::new(),
                 repeat: 1,
+                concurrent: 0,
+                workers: None,
                 round: None,
             };
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     #[cfg(feature = "round")]
                     "--repeat" => a.repeat = it.next()?.parse().ok().filter(|&n| n > 0)?,
+                    #[cfg(feature = "round")]
+                    "--concurrent" => a.concurrent = it.next()?.parse().ok().filter(|&n| n > 0)?,
+                    #[cfg(feature = "round")]
+                    "--workers" => a.workers = Some(it.next()?.parse().ok().filter(|&n| n > 0)?),
                     #[cfg(feature = "round")]
                     "--round" => a.round = Some(it.next()?),
                     _ if a.page.is_empty() && !arg.starts_with("--") => a.page = arg,
@@ -66,13 +78,16 @@ fn args() -> Option<Args> {
     }
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
-    tokio::runtime::Builder::new_multi_thread()
-        .build()
-        .map_err(|e| {
-            eprintln!("whp: the tokio runtime did not start: {e}");
-            ExitCode::from(2)
-        })
+fn runtime(workers: Option<usize>) -> Result<tokio::runtime::Runtime, ExitCode> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_time();
+    if let Some(w) = workers {
+        builder.worker_threads(w);
+    }
+    builder.build().map_err(|e| {
+        eprintln!("whp: the tokio runtime did not start: {e}");
+        ExitCode::from(2)
+    })
 }
 
 fn main() -> ExitCode {
@@ -91,7 +106,7 @@ fn run(args: Args) -> ExitCode {
         }
     };
     let store: &'static FileStore = Box::leak(Box::new(FileStore::new(cwd)));
-    let runtime = match runtime() {
+    let runtime = match runtime(args.workers) {
         Ok(r) => r,
         Err(code) => return code,
     };
@@ -106,7 +121,7 @@ fn run(args: Args) -> ExitCode {
             let _ = &args;
             tokio::spawn(async move {
                 let mut out = std::io::BufWriter::new(std::io::stdout());
-                host::page(store, page, &mut out).map(|_| ())
+                host::page(store, page, &mut out).await.map(|_| ())
             })
             .await
             .map_err(|e| whp::Refusal::at(format!("the request's task: {e}"), 0))?

@@ -7,12 +7,17 @@
 //! made is thrown away. Each page gives PHP's own bytes, or is refused with a [`Refusal`] that
 //! names what whp met and the line it met it on; whp never runs a page differently.
 //!
-//! A page is compiled once ([`compile_page`]) and kept by its host's [`Store`]. [`run()`] runs one
-//! request: the page, top to bottom, written to a sink the host gives it. A page an include asks
-//! for comes from the store, and whp does no I/O of its own.
+//! A request is an iterator over its waits. In PHP a request runs to its end inside the engine,
+//! which blocks at every sleep and every page it loads. Here a page is compiled once
+//! ([`compile_page`]) and kept by its host's [`Store`], and a [`Request`] runs it, writing the
+//! page to a sink the host gives it, until it must wait: `sleep()`, `usleep()`, or a page its
+//! store has not kept. It hands the wait back as a [`Step`], the host does it with whatever Rust
+//! library suits it, and resumes the request. whp does no I/O of its own: the store, the timer,
+//! the loader and the runtime are the host's. [`run()`] drives one request to its end on the
+//! calling thread.
 //!
 //! ```
-//! use whp::{Page, Refusal, Store, compile_page};
+//! use whp::{Page, Refusal, Request, Step, Store, Wait, compile_page};
 //!
 //! /// A store holding one page, kept from the start.
 //! struct One(&'static Page);
@@ -30,7 +35,17 @@
 //! let page: &'static Page = Box::leak(Box::new(compile_page(b"/hello.php", source).unwrap()));
 //! let store = One(page);
 //! let mut out = Vec::new();
-//! whp::run(&store, page, &mut out).unwrap();
+//! let mut request = Request::new(&store, page);
+//! loop {
+//!     match request.resume(&mut out).unwrap() {
+//!         Step::Done(_) => break,
+//!         Step::Wait(Wait::Sleep(time)) => std::thread::sleep(time),
+//!         Step::Wait(Wait::Page { path, from_dir }) => {
+//!             let loaded = store.load(&path, &from_dir).map_err(|r| request.failed(r));
+//!             request.loaded(loaded.unwrap());
+//!         }
+//!     }
+//! }
 //! assert_eq!(out, b"<p>Hello, world</p>\n");
 //! ```
 //!
@@ -48,7 +63,7 @@ mod store;
 mod value;
 
 pub use compile::{Page, compile_page};
-pub use run::{Outcome, run};
+pub use run::{Outcome, Request, Step, Wait, run};
 pub use store::Store;
 
 use std::fmt;
