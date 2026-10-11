@@ -12,6 +12,9 @@ repository.workspace = true
 readme.workspace = true
 exclude = ["tests/"]
 
+[features]
+poison = []
+
 [dependencies]
 bumpalo = { version = "3.20", features = ["collections", "allocator-api2"] }
 hashbrown = "0.16"

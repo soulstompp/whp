@@ -1,8 +1,9 @@
 // Copyright (C) 2026 Kenneth Allen Flegal and DappleAI
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! A request: one page run to its end. What the request makes lives in its block, dropped whole
-//! when the page has gone out.
+//! A request: one page run to its end. What the request makes lives in blocks: the request's own,
+//! dropped whole when the page has gone out, and one for each call, dropped when the call returns.
+//! What a call gives back is copied out of its block first.
 //!
 //! PHP's frames are kept in the request's block, never on Rust's stack: a call pushes a frame and
 //! a return pops one, so a page may call as deep as its memory allows, and the request's state is
@@ -20,7 +21,7 @@ use crate::compile::{Code, Function, Lit, Op, Page};
 use crate::parse::{BinOp, IncludeKind, UnOp};
 use crate::store::Store;
 use crate::value::{
-    Array, Value, compare, identical, loose_equal, release, share, string_fits, to_bytes,
+    Array, Key, Value, compare, identical, loose_equal, release, share, string_fits, to_bytes,
     to_int_operand, to_key, truthy,
 };
 
@@ -33,6 +34,8 @@ pub struct Outcome {
     pub block_bytes: usize,
     /// The calls of the page's own functions it made.
     pub calls: u64,
+    /// The bytes the largest block of a call took.
+    pub call_block_max: usize,
 }
 
 /// Runs `entry` as one request to its end, writing its page to `sink`. A page an include asks for
@@ -50,7 +53,17 @@ pub fn run<S: Store + ?Sized>(
         out_bytes: machine.out_bytes,
         block_bytes: block.allocated_bytes(),
         calls: machine.calls,
+        call_block_max: machine.block_bytes_max,
     })
+}
+
+/// Whether `p` points into memory `block` has handed out.
+fn holds(block: &Bump, p: *const u8) -> bool {
+    let p = p as usize;
+    // SAFETY: nothing is allocated in `block` while its chunks are walked, and they are only
+    // compared with, never read.
+    unsafe { block.iter_allocated_chunks_raw() }
+        .any(|(start, len)| (start as usize..start as usize + len).contains(&p))
 }
 
 type Map<'r, K, V> = HashMap<K, V, DefaultHashBuilder, &'r Bump>;
@@ -95,9 +108,18 @@ enum Flow {
 
 struct Machine<'r, 's, S: Store + ?Sized> {
     request: &'r Bump,
+    /// One block for each call in progress, the innermost last. Each is boxed so it stays put
+    /// while the list grows: what a call makes holds a reference to its block.
+    #[allow(clippy::vec_box)]
+    blocks: Vec<Box<Bump>>,
+    /// Blocks overwritten and kept instead of dropped, so a read of one after its call is seen.
+    #[cfg(feature = "poison")]
+    #[allow(clippy::vec_box)]
+    poisoned: Vec<Box<Bump>>,
     calls: u64,
     /// The calls of the page's own functions in progress.
     live_calls: usize,
+    block_bytes_max: usize,
     store: &'s S,
     out_bytes: u64,
     stack: BVec<'r, Value<'r>>,
@@ -122,8 +144,12 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
     fn new(bump: &'r Bump, store: &'s S) -> Self {
         Machine {
             request: bump,
+            blocks: Vec::new(),
+            #[cfg(feature = "poison")]
+            poisoned: Vec::new(),
             calls: 0,
             live_calls: 0,
+            block_bytes_max: 0,
             store,
             out_bytes: 0,
             stack: BVec::new_in(bump),
@@ -135,9 +161,56 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
         }
     }
 
-    /// The block what is made now goes into: the request's.
+    /// The block what is made now goes into: the innermost call's, or the request's.
     fn cur(&self) -> &'r Bump {
-        self.request
+        match self.blocks.last() {
+            // SAFETY: a call's block is dropped only when its call returns, after the call's
+            // frame, stack, walks and scope are gone and its return value is copied out of it
+            // (`evacuate`); nothing else made in a call outlives it, so nothing read later points
+            // into a dropped block.
+            Some(b) => unsafe { &*(&**b as *const Bump) },
+            None => self.request,
+        }
+    }
+
+    /// `v`, with whatever of it lies in `from` copied into the current block. A caller's array
+    /// the call wrote while it alone held it is rewritten in place.
+    fn evacuate(&self, v: Value<'r>, from: &Bump) -> Value<'r> {
+        match v {
+            Value::Str(s) if holds(from, s.as_ptr()) => Value::Str(self.cur().alloc_slice_copy(s)),
+            Value::Array(a) if holds(from, a as *const Array<'r> as *const u8) => {
+                Value::Array(a.moved(self.cur(), |k, e| {
+                    (self.evacuate_key(k, from), self.evacuate(e, from))
+                }))
+            }
+            Value::Array(a) => {
+                a.rewrite(|k, e| (self.evacuate_key(k, from), self.evacuate(e, from)));
+                v
+            }
+            v => v,
+        }
+    }
+
+    fn evacuate_key(&self, k: Key<'r>, from: &Bump) -> Key<'r> {
+        match k {
+            Key::Str(s) if holds(from, s.as_ptr()) => Key::Str(self.cur().alloc_slice_copy(s)),
+            k => k,
+        }
+    }
+
+    /// Lets a returned call's block go.
+    fn drop_block(&mut self, block: Box<Bump>) {
+        #[cfg(feature = "poison")]
+        {
+            // SAFETY: the chunks are the block's own memory, which nothing reads any more; they
+            // are overwritten through the block's raw pointers and kept until the request ends.
+            for (p, len) in unsafe { block.iter_allocated_chunks_raw() } {
+                unsafe { std::ptr::write_bytes(p, 0xA5, len) };
+            }
+            self.poisoned.push(block);
+        }
+        #[cfg(not(feature = "poison"))]
+        drop(block);
     }
 
     fn new_scope(&self) -> &'r Scope<'r> {
@@ -831,6 +904,7 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                     line,
                 ));
             }
+            self.blocks.push(Box::new(Bump::new()));
             self.calls += 1;
             self.live_calls += 1;
             let scope = self.new_scope();
@@ -895,6 +969,10 @@ impl<'r, 's, S: Store + ?Sized> Machine<'r, 's, S> {
                 release(held);
             }
             self.live_calls -= 1;
+            let block = self.blocks.pop().expect("the call's block");
+            let v = self.evacuate(v, &block);
+            self.block_bytes_max = self.block_bytes_max.max(block.allocated_bytes());
+            self.drop_block(block);
             v
         } else {
             v

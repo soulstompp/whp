@@ -120,6 +120,7 @@ pub struct Row {
     pub block_bytes: u64,
     pub out_bytes: u64,
     pub calls: u64,
+    pub call_block_max: u64,
     pub process_live_after: i64,
     pub workers: u64,
     pub teardown_waits: u64,
@@ -169,6 +170,7 @@ async fn request(
                 block_bytes: result.as_ref().map_or(0, |o| o.block_bytes as u64),
                 out_bytes: result.as_ref().map_or(0, |o| o.out_bytes),
                 calls: result.as_ref().map_or(0, |o| o.calls),
+                call_block_max: result.as_ref().map_or(0, |o| o.call_block_max as u64),
                 refused: result.is_err(),
                 ..Row::default()
             };
@@ -228,7 +230,7 @@ fn write(file: &str, rows: &[Row]) -> std::io::Result<()> {
     for r in rows {
         let _ = writeln!(
             s,
-            "{{\"request\":{},\"polls\":{},\"page_reads\":{},\"page_bytes\":{},\"rchar\":{},\"kept_bytes\":{},\"peak_bytes\":{},\"block_bytes\":{},\"out_bytes\":{},\"calls\":{},\"process_live_after\":{},\"workers\":{},\"teardown_waits\":{},\"refused\":{}}}",
+            "{{\"request\":{},\"polls\":{},\"page_reads\":{},\"page_bytes\":{},\"rchar\":{},\"kept_bytes\":{},\"peak_bytes\":{},\"block_bytes\":{},\"out_bytes\":{},\"calls\":{},\"call_block_max\":{},\"process_live_after\":{},\"workers\":{},\"teardown_waits\":{},\"refused\":{}}}",
             r.request,
             r.polls,
             r.page_reads,
@@ -239,6 +241,7 @@ fn write(file: &str, rows: &[Row]) -> std::io::Result<()> {
             r.block_bytes,
             r.out_bytes,
             r.calls,
+            r.call_block_max,
             r.process_live_after,
             r.workers,
             r.teardown_waits,

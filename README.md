@@ -91,7 +91,8 @@ refuses the page.
   whp keeps it for as long as the process runs. Every later request runs the kept page and reads
   nothing from the disk, so a page whose file changes is read again only when whp starts again.
 - **Nothing a request made outlives it.** What a request makes is let go all at once when its
-  page has gone out, so requests share nothing but the kept pages.
+  page has gone out, and what a call makes, when the call returns, so requests share nothing but
+  the kept pages.
 - **whp stops where PHP's memory would.** Under its default `memory_limit` of 128M, PHP cannot
   hold a string of 128 MiB or more, an array of more than 4,194,304 elements, or 915,135 calls at
   once. whp refuses a page that reaches one of these.
@@ -104,7 +105,7 @@ of its own:
 - a `Store` keeps the compiled pages: in a map, on a disk, behind a cache, wherever you keep
   them;
 - `whp::run` runs one request to its end, writing its page to any `std::io::Write`, and gives back
-  an `Outcome`: the bytes of the page, of its block, and its calls; a page whp will not run gives
+  an `Outcome`: the bytes of the page, of its blocks, and its calls; a page whp will not run gives
   a `Refusal`, with what whp met, the page and the line.
 
 A host with one page:
@@ -173,8 +174,10 @@ a wrong argument.
 
 - **`round`** counts what each request does. `whp run` gains `--repeat N` (N requests, one after
   another) and `--round <file.jsonl>`, one JSON line a request: how often the stack polled it,
-  the files it read, its heap at the peak, the bytes of its block, its calls, and its page's
+  the files it read, its heap at the peak, the bytes of its blocks, its calls, and its page's
   bytes.
+- **`poison`** overwrites the memory of a call that has returned, and keeps it, so a page that
+  read it afterwards would come out wrong. It is for testing.
 
 ### Tests
 

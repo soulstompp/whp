@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Kenneth Allen Flegal and DappleAI
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Values, as a request holds them: everything a request makes lives in its block.
+//! Values, as a request holds them: everything a request makes lives in its blocks.
 //!
 //! An array is shared between its holders and copied before a holder writes to it, so each holder
 //! sees an array of its own, as PHP's arrays behave. `refs` counts the holders: a variable, an
@@ -203,6 +203,44 @@ impl<'r> Array<'r> {
             dst.next = src.next;
         }
         new
+    }
+
+    /// A copy of the array in `bump`, each entry passed through `f`. The copy takes over the
+    /// array's holds on its elements.
+    pub fn moved(
+        &self,
+        bump: &'r Bump,
+        mut f: impl FnMut(Key<'r>, Value<'r>) -> (Key<'r>, Value<'r>),
+    ) -> &'r Array<'r> {
+        let new = Array::new(bump);
+        {
+            let src = self.map.borrow();
+            let mut dst = new.map.borrow_mut();
+            for (k, v) in src.entries.iter().flatten().copied() {
+                let (k, v) = f(k, v);
+                let pos = dst.entries.len();
+                dst.entries.push(Some((k, v)));
+                dst.index.insert(k, pos);
+            }
+            dst.len = src.len;
+            dst.next = src.next;
+        }
+        new
+    }
+
+    /// Rewrites every entry in place through `f`, and the index with it.
+    pub fn rewrite(&self, mut f: impl FnMut(Key<'r>, Value<'r>) -> (Key<'r>, Value<'r>)) {
+        let mut m = self.map.borrow_mut();
+        for e in m.entries.iter_mut().flatten() {
+            *e = f(e.0, e.1);
+        }
+        let Map { entries, index, .. } = &mut *m;
+        index.clear();
+        for (pos, e) in entries.iter().enumerate() {
+            if let Some((k, _)) = e {
+                index.insert(*k, pos);
+            }
+        }
     }
 }
 
