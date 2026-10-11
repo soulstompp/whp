@@ -1,8 +1,8 @@
 [package]
 name = "whp-tokio"
-description = "The whp command: PHP 8 templates run as requests on the tokio stack, from the command line (whp run)."
+description = "The whp command: PHP 8 templates run as requests on the tokio stack, from the command line (whp run) or over HTTP (whp serve)."
 keywords = ["php", "template", "interpreter", "tokio", "web"]
-categories = ["template-engine", "command-line-utilities"]
+categories = ["template-engine", "web-programming::http-server", "command-line-utilities"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,4 +22,6 @@ poison = ["whp/poison"]
 
 [dependencies]
 whp = { path = "../whp", version = "0.0.1" }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

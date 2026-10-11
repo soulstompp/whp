@@ -40,6 +40,15 @@ $ whp run hello.php
 <p>Hello, world!</p>
 ```
 
+Or serve the directory it is in, and ask for it over HTTP:
+
+```console
+$ whp serve .
+whp: serving /home/you/site at http://127.0.0.1:8080
+$ curl http://127.0.0.1:8080/hello.php
+<p>Hello, world!</p>
+```
+
 A page that needs something whp does not run yet is refused. This one divides 7 by 2, and the
 answer, 3.5, is a float:
 
@@ -101,7 +110,20 @@ refuses the page.
   the kept pages.
 - **whp stops where PHP's memory would.** Under its default `memory_limit` of 128M, PHP cannot
   hold a string of 128 MiB or more, an array of more than 4,194,304 elements, or 915,135 calls at
-  once. whp refuses a page that reaches one of these.
+  once. whp refuses a page that reaches one of these, and goes on serving the others.
+
+## Serving
+
+`whp serve <dir> [--addr 127.0.0.1:8080]` serves the pages under `<dir>` over HTTP/1.1, each HTTP
+request one request.
+
+- A path that ends in `.php` and names a file under `<dir>` gets 200 and the page, as
+  `text/html; charset=UTF-8`. Anything else gets 404 with an empty body: other files, `/`, a
+  missing page, and any path with a `..` segment. The path is taken as written, and the query
+  string is not read.
+- The page goes out as it is written, a part at every wait. A page refused partway breaks its
+  response, so a client never takes the page so far for the whole page.
+- Includes are found as PHP finds them, from `<dir>`.
 
 ## A request is an iterator over its waits
 
@@ -191,17 +213,18 @@ when those do.
 | Command | What it does |
 |---|---|
 | `whp run <page.php>` | runs the page as one request and writes it to stdout |
+| `whp serve <dir> [--addr <addr>]` | serves `<dir>`'s pages over HTTP/1.1, at `127.0.0.1:8080` unless `--addr` says otherwise |
 
 `whp` exits 0 when the page went out whole, 3 when whp refused it, and 2 when it could not start:
-a wrong argument.
+a wrong argument, or a directory it cannot serve.
 
 ### Features
 
 - **`round`** counts what each request does. `whp run` gains `--repeat N` (N requests, one after
-  another), `--concurrent N` (then N at once, each giving the same page), `--workers W` (the
-  stack's worker threads) and `--round <file.jsonl>`, one JSON line a request: how often the stack
-  polled it, its waits, the files it read, its heap at the peak, the bytes of its blocks, its
-  calls, and its page's bytes.
+  another), `--concurrent N` (then N at once, each giving the same page) and `--workers W` (the
+  stack's worker threads); `whp serve` gains `--workers W`; and both take `--round <file.jsonl>`,
+  one JSON line a request: how often the stack polled it, its waits, the files it read, its heap
+  at the peak, the bytes of its blocks, its calls, and its page's bytes.
 - **`poison`** overwrites the memory of a call that has returned, and keeps it, so a page that
   read it afterwards would come out wrong. It is for testing.
 

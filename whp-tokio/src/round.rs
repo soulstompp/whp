@@ -11,8 +11,8 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -289,6 +289,83 @@ pub async fn drive(
         Some(r) => Err(r),
         None => Ok(()),
     }
+}
+
+/// The round of a server: each request's row, appended to its file as the request ends.
+pub struct Log {
+    file: Mutex<std::fs::File>,
+    t0: Instant,
+    next: AtomicU64,
+}
+
+impl Log {
+    pub fn create(path: &str) -> std::io::Result<&'static Log> {
+        let file = std::fs::File::create(path)?;
+        Ok(Box::leak(Box::new(Log {
+            file: Mutex::new(file),
+            t0: Instant::now(),
+            next: AtomicU64::new(0),
+        })))
+    }
+}
+
+/// Runs a served request on a task of its own, counted as a request of `whp run` is, and appends
+/// its row to `log` when it ends. Over HTTP a row holds what its request did: its polls and
+/// waits, its page, its calls and its heap at the peak; what the process read, the request
+/// cannot tell apart from what the server read.
+pub fn spawn_served<F>(request: F, log: &'static Log)
+where
+    F: Future<Output = Result<host::Served, whp::Refusal>> + Send + 'static,
+{
+    let polls = Arc::new(AtomicU32::new(0));
+    let count = Arc::new(TaskCount::default());
+    let task_count = count.clone();
+    let n = log.next.fetch_add(1, Ordering::Relaxed);
+    let t0 = log.t0;
+    let task = Counted {
+        inner: Box::pin(async move {
+            let begun = t0.elapsed().as_micros() as u64;
+            let live0 = task_count.live.load(Ordering::Relaxed);
+            task_count.peak.store(live0, Ordering::Relaxed);
+            let result = request.await;
+            let peak = task_count.peak.load(Ordering::Relaxed);
+            Row {
+                request: n,
+                waits: result.as_ref().map_or(0, |s| s.waits),
+                peak_bytes: (peak - live0) as i64,
+                block_bytes: result.as_ref().map_or(0, |s| s.outcome.block_bytes as u64),
+                out_bytes: result.as_ref().map_or(0, |s| s.outcome.out_bytes),
+                calls: result.as_ref().map_or(0, |s| s.outcome.calls),
+                refused: result.is_err(),
+                started_us: begun,
+                ended_us: t0.elapsed().as_micros() as u64,
+                ..Row::default()
+            }
+        }),
+        polls: polls.clone(),
+        count,
+    };
+    tokio::spawn(async move {
+        let mut row = task.await;
+        row.polls = polls.load(Ordering::Relaxed);
+        let line = format!(
+            "{{\"request\":{},\"polls\":{},\"waits\":{},\"peak_bytes\":{},\"block_bytes\":{},\"out_bytes\":{},\"calls\":{},\"started_us\":{},\"ended_us\":{},\"refused\":{}}}\n",
+            row.request,
+            row.polls,
+            row.waits,
+            row.peak_bytes,
+            row.block_bytes,
+            row.out_bytes,
+            row.calls,
+            row.started_us,
+            row.ended_us,
+            row.refused
+        );
+        let mut file = log.file.lock().expect("the round's file");
+        if let Err(e) = file.write_all(line.as_bytes()) {
+            eprintln!("whp: writing the round: {e}");
+        }
+    });
 }
 
 /// The round as JSON lines.

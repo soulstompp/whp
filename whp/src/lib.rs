@@ -50,7 +50,7 @@
 //! ```
 //!
 //! The `whp-tokio` crate is the host on the tokio stack, the `whp` command: `whp run` runs a page
-//! from the command line.
+//! from the command line, and `whp serve` serves a directory's pages over HTTP.
 
 #![warn(missing_docs)]
 
